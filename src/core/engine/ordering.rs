@@ -23,7 +23,7 @@ pub fn get_ordered_blocks(dag: &Dag, ghostdag: &GhostDag) -> Vec<Hash> {
     let blue_set = ghostdag.get_blue_set(dag, &virtual_block);
 
     // Red set: all blocks not in chain or blue_set
-    let all_blocks: HashSet<_> = dag.get_all_hashes();
+    let all_blocks: HashSet<_> = dag.get_all_hashes().into_iter().collect();
     let chain_set: HashSet<_> = chain.iter().cloned().collect();
     let red_set: HashSet<_> = all_blocks.difference(&chain_set).filter(|h| !blue_set.contains(h)).cloned().collect();
 

@@ -1,8 +1,15 @@
 use blake3;
 use hex;
+use std::fmt;
 
 #[derive(Clone, Eq, PartialEq, Hash, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Hash([u8; 32]);
+
+impl fmt::Display for Hash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
 
 impl Hash {
     pub fn new(data: &[u8]) -> Self {

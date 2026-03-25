@@ -16,8 +16,10 @@ impl Dag {
         }
     }
 
-    pub fn get_all_hashes(&self) -> HashSet<Hash> {
-        self.blocks.keys().cloned().collect()
+    pub fn get_all_hashes(&self) -> Vec<Hash> {
+        let mut hashes: Vec<_> = self.blocks.keys().cloned().collect();
+        hashes.sort();
+        hashes
     }
 
     pub(crate) fn get_block_mut(&mut self, id: &Hash) -> Option<&mut BlockNode> {
@@ -53,8 +55,11 @@ impl Dag {
         let parents = block.parents.clone();
         self.blocks.insert(id.clone(), block);
 
-        for parent_hash in &parents {
-            if let Some(parent_block) = self.blocks.get_mut(parent_hash) {
+        // Deterministic parent update: sort for consistent order
+        let mut sorted_parents: Vec<_> = parents.iter().cloned().collect();
+        sorted_parents.sort();
+        for parent_hash in sorted_parents {
+            if let Some(parent_block) = self.blocks.get_mut(&parent_hash) {
                 parent_block.children.insert(id.clone());
             }
         }
@@ -71,8 +76,10 @@ impl Dag {
         self.blocks.get(id)
     }
 
-    pub fn get_tips(&self) -> HashSet<Hash> {
-        self.tips.iter().cloned().collect()
+    pub fn get_tips(&self) -> Vec<Hash> {
+        let mut tips: Vec<_> = self.tips.iter().cloned().collect();
+        tips.sort();
+        tips
     }
 
     pub fn is_ancestor(&self, a: &Hash, b: &Hash) -> bool {
@@ -87,18 +94,21 @@ impl Dag {
             }
             visited.insert(current.clone());
             if let Some(block) = self.blocks.get(&current) {
-                for parent in &block.parents {
-                    if parent == a {
+                // Deterministic traversal: sort parents for consistent order
+                let mut sorted_parents: Vec<_> = block.parents.iter().cloned().collect();
+                sorted_parents.sort();
+                for parent in sorted_parents {
+                    if parent == *a {
                         return true;
                     }
-                    stack.push(parent.clone());
+                    stack.push(parent);
                 }
             }
         }
         false
     }
 
-    pub fn get_ancestors(&self, id: &Hash) -> HashSet<Hash> {
+    pub fn get_ancestors(&self, id: &Hash) -> Vec<Hash> {
         let mut ancestors = HashSet::new();
         let mut stack = vec![id.clone()];
         let mut visited = HashSet::new();
@@ -108,13 +118,19 @@ impl Dag {
             }
             visited.insert(current.clone());
             if let Some(block) = self.blocks.get(&current) {
-                for parent in &block.parents {
+                // Deterministic traversal: sort parents for consistent order
+                let mut sorted_parents: Vec<_> = block.parents.iter().cloned().collect();
+                sorted_parents.sort();
+                for parent in sorted_parents {
                     ancestors.insert(parent.clone());
-                    stack.push(parent.clone());
+                    stack.push(parent);
                 }
             }
         }
-        ancestors
+        // Return sorted Vec for deterministic ordering
+        let mut result: Vec<_> = ancestors.into_iter().collect();
+        result.sort();
+        result
     }
 
     pub fn get_descendants(&self, id: &Hash) -> Vec<Hash> {
@@ -125,19 +141,24 @@ impl Dag {
 
         while let Some(current) = stack.pop() {
             if let Some(block) = self.blocks.get(&current) {
-                for child in &block.children {
+                // Deterministic traversal: sort children for consistent order
+                let mut sorted_children: Vec<_> = block.children.iter().cloned().collect();
+                sorted_children.sort();
+                for child in sorted_children {
                     if visited.insert(child.clone()) {
                         descendants.push(child.clone());
-                        stack.push(child.clone());
+                        stack.push(child);
                     }
                 }
             }
         }
 
+        // Sort for deterministic ordering
+        descendants.sort();
         descendants
     }
 
-    pub fn get_anticone(&self, id: &Hash) -> HashSet<Hash> {
+    pub fn get_anticone(&self, id: &Hash) -> Vec<Hash> {
         anticone::get_anticone(self, id)
     }
 

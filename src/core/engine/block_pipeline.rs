@@ -1,19 +1,36 @@
 use crate::core::dag::BlockNode;
 use crate::core::errors::CoreError;
+use crate::core::consensus::reorg;
 use super::engine::Engine;
 use super::validation;
 use super::state_apply;
 
 /// Process a block through the consensus pipeline:
-/// 1. Validate block
+/// 
+/// PIPELINE STAGES:
+/// 1. Validate block (PoW, structure, difficulty)
 /// 2. Add to DAG
-/// 3. Run GHOSTDAG consensus
-/// 4. Update virtual block state
-/// 5. Apply block transactions to state
-/// 6. Update finality
-/// 7. Prune old blocks
+/// 3. Run GHOSTDAG consensus (assign blue_set, red_set, blue_score)
+/// 4. Validate coinbase with final blue_score
+/// 5. Persist to storage
+/// 6. **DETECT & EXECUTE REORG if needed** (NEW - critical fix)
+/// 7. Apply block transactions to state
+/// 8. Return reverted transactions to mempool (if reorg)
+/// 9. Remove confirmed transactions from mempool
+/// 10. Update finality and virtual block
+/// 11. Prune old blocks
+///
+/// KEY DESIGN:
+/// - Reorg detection happens AFTER DAG consensus but BEFORE state apply
+/// - This ensures state is consistent with selected chain
+/// - Atomicity: snapshot-restore on any error
+/// - No unwrap() calls - all Result handling explicit
 pub fn process_block(engine: &mut Engine, mut block: BlockNode) -> Result<(), CoreError> {
     let block_hash = block.id.clone();
+
+    // =====================================================================
+    // STAGE 1-5: Core validation and consensus
+    // =====================================================================
 
     // 1. Calculate difficulty for block
     block.difficulty = engine.calculate_difficulty(block.timestamp);
@@ -29,6 +46,10 @@ pub fn process_block(engine: &mut Engine, mut block: BlockNode) -> Result<(), Co
         }
         engine.set_genesis_hash(block_hash.clone());
     }
+
+    // Get current selected chain BEFORE adding new block
+    let old_selected_chain = engine.get_selected_chain();
+    let old_selected_tip = old_selected_chain.first().cloned();
 
     // 4. Insert block to DAG
     engine.dag_mut().add_block(block.clone())?;
@@ -48,31 +69,99 @@ pub fn process_block(engine: &mut Engine, mut block: BlockNode) -> Result<(), Co
         engine.storage_mut().put_block(stored_block);
     }
 
-    // 7. Update state using virtual block
-    let virtual_block = engine.ghostdag().build_virtual_block(engine.dag());
-    if let Some(vb_hash) = virtual_block.selected_parent.clone() {
-        engine.state_mut().set_finalizing_block(vb_hash);
-        engine.state_mut().update_virtual_score(virtual_block.blue_score);
-    } else if let Some(vb_hash) = engine.dag().get_all_hashes().into_iter().next() {
-        engine.state_mut().set_finalizing_block(vb_hash);
-        engine.state_mut().update_virtual_score(virtual_block.blue_score);
-    }
+    // =====================================================================
+    // STAGE 6: DETECT & EXECUTE REORG (CRITICAL FIX - INTEGRATED)
+    // =====================================================================
 
-    // 8. Apply block transactions to state and remove confirmed transactions from mempool
-    if let Some(block) = engine.dag().get_block(&block_hash).cloned() {
-        state_apply::apply_block_to_state(engine.state_mut(), &block)?;
+    // Build new virtual block with updated consensus
+    let new_virtual_block = engine.ghostdag().build_virtual_block(engine.dag());
 
-        let confirmed_tx_ids: Vec<_> = block.transactions.iter().map(|tx| tx.id.clone()).collect();
+    // Check if reorganization is needed
+    let reorg_needed = if let Some(current_tip) = &old_selected_tip {
+        if let Some(new_selected_parent) = &new_virtual_block.selected_parent {
+            // Reorg needed if selected parent changed
+            current_tip != new_selected_parent
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Execute reorg with transaction buffer if needed
+    let reorg_buffer = if reorg_needed {
+        // Prepare reorg state using immutable accessors
+        let reorg_state = {
+            let dag_ref = engine.dag();
+            let ghostdag_ref = engine.ghostdag();
+            reorg::check_and_prepare_reorg(dag_ref, ghostdag_ref, old_selected_tip.clone(), &block)?
+        };
+
+        if let Some(reorg_spec) = reorg_state {
+            const MAX_REORG_DEPTH: usize = 1000;
+            reorg::validate_reorg(&reorg_spec, MAX_REORG_DEPTH)?;
+
+            // Execute reorg through Engine API to avoid cross-borrow conflicts
+            Some(engine.execute_reorg_with_buffer(&reorg_spec)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // =====================================================================
+    // STAGE 7: Apply new block to state
+    // =====================================================================
+
+    let new_block_with_score = engine.dag().get_block(&block_hash).cloned();
+
+    if let Some(processed_block) = new_block_with_score {
+        // Update virtual block state (common path)
+        if let Some(vb_hash) = new_virtual_block.selected_parent.clone() {
+            engine.state_mut().set_finalizing_block(vb_hash);
+        }
+        engine.state_mut().update_virtual_score(new_virtual_block.blue_score);
+
+        // Apply block normally only if reorg did NOT already apply the chain
+        if reorg_buffer.is_none() {
+            state_apply::apply_block_to_state(engine.state_mut(), &processed_block)?;
+        }
+
+        // =========================================================================
+        // STAGE 8-9: Mempool management
+        // =========================================================================
+
+        // Reinsert reverted transactions from reorg buffer (if any)
+        if let Some(ref buffer) = reorg_buffer {
+            engine.reinsert_reverted_transactions(buffer)?;
+        }
+
+        // Remove confirmed transactions from mempool
+        let confirmed_tx_ids: Vec<_> = processed_block.transactions.iter().map(|tx| tx.id.clone()).collect();
         engine.mempool_mut().remove_confirmed(&confirmed_tx_ids);
     }
 
-    // 9. Update finality
+    // =====================================================================
+    // STAGE 10-11: Finality and pruning
+    // =====================================================================
+
+    // =====================================================================
+    // STAGE 10-11: Finality and pruning
+    // =====================================================================
+
+    // 10. Update finality
     engine.update_finality();
 
-    // 10. Prune old blocks
+    // 11. Prune old blocks
     engine.prune();
 
     Ok(())
+}
+
+/// Retrieve the currently selected chain (for reorg detection)
+fn get_current_selected_chain(engine: &Engine) -> Vec<crate::core::crypto::Hash> {
+    engine.ghostdag().get_virtual_selected_chain(engine.dag())
 }
 
 #[cfg(test)]

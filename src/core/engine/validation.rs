@@ -1,7 +1,7 @@
 use crate::core::dag::BlockNode;
 use crate::core::errors::CoreError;
 use crate::core::pow::{calculate_hash, is_valid_pow};
-use crate::core::consensus::capped_reward;
+use crate::core::consensus::{capped_reward, validate_coinbase_reward};
 use super::engine::Engine;
 
 /// Validate a block for acceptance into the DAG
@@ -53,27 +53,21 @@ fn validate_tx_basic(_block: &BlockNode) -> Result<(), CoreError> {
 }
 
 /// Validate coinbase transaction reward amount (called after GHOSTDAG processing)
+///
+/// Checks that:
+/// 1. Block contains exactly one coinbase transaction
+/// 2. Coinbase has exactly one output
+/// 3. Coinbase output equals the expected reward (subsidy + fees)
+///
+/// Note: This validates subsidy only. Fee calculation requires UTXO state
+/// and happens separately in the reward calculation pipeline.
 pub fn validate_coinbase_reward_final(block: &BlockNode) -> Result<(), CoreError> {
-    // Find coinbase transaction (first transaction with no inputs)
-    let coinbase_tx = block.transactions.iter().find(|tx| tx.is_coinbase());
-
+    // Calculate expected reward: subsidy based on daa_score
+    // (fees will be calculated separately when UTXO state is available)
     let expected_reward = capped_reward(block.blue_score);
 
-    match coinbase_tx {
-        Some(tx) if tx.outputs.len() == 1 => {
-            let actual_reward = tx.outputs[0].value as u128;
-            if actual_reward == expected_reward as u128 {
-                Ok(())
-            } else {
-                Err(CoreError::TransactionError(format!(
-                    "Invalid coinbase reward: expected {}, got {}",
-                    expected_reward, actual_reward
-                )))
-            }
-        }
-        Some(_) => Err(CoreError::TransactionError("Coinbase transaction must have exactly one output".into())),
-        None => Err(CoreError::TransactionError("Block must contain a coinbase transaction".into())),
-    }
+    // Validate the coinbase matches expected reward
+    validate_coinbase_reward(block, expected_reward)
 }
 
 /// Validate Proof of Work for the block

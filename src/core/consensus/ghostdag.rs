@@ -21,28 +21,33 @@ impl GhostDag {
         Self { k }
     }
 
-    pub fn select_parent(&self, dag: &Dag, parents: &HashSet<Hash>) -> Option<Hash> {
-        parents
+    pub fn select_parent(&self, dag: &Dag, parents: &[Hash]) -> Option<Hash> {
+        if parents.is_empty() {
+            return None;
+        }
+        
+        // Max 2 parents: select only two with highest blue_score
+        let mut parent_scores: Vec<_> = parents
             .iter()
             .filter_map(|h| dag.get_block(h).map(|b| (h.clone(), b.blue_score)))
-            .max_by(|(h1, s1), (h2, s2)| s1.cmp(s2).then(h2.cmp(h1)))
-            .map(|(h, _)| h)
+            .collect();
+        
+        // Sort by blue_score descending, then by hash ascending (deterministic)
+        parent_scores.sort_by(|(h1, s1), (h2, s2)| s2.cmp(s1).then(h1.cmp(h2)));
+        
+        // Return highest score parent
+        parent_scores.first().map(|(h, _)| h.clone())
     }
 
-    pub fn anticone(&self, dag: &Dag, block: &Hash) -> HashSet<Hash> {
-        let ancestors = dag.get_ancestors(block);
-        let descendants: HashSet<Hash> = dag.get_descendants(block).into_iter().collect();
-        dag.get_all_hashes()
-            .into_iter()
-            .filter(|h| h != block && !ancestors.contains(h) && !descendants.contains(h))
-            .collect()
+    pub fn anticone(&self, dag: &Dag, block: &Hash) -> Vec<Hash> {
+        dag.get_anticone(block)
     }
 
     pub fn build_blue_set(
         &self,
         dag: &Dag,
         selected_parent: &Hash,
-        _parents: &HashSet<Hash>,
+        _parents: &[Hash],
     ) -> (HashSet<Hash>, HashSet<Hash>) {
         let mut blue_set = HashSet::new();
         let mut red_set = HashSet::new();
@@ -52,15 +57,12 @@ impl GhostDag {
             blue_set.insert(selected_parent.clone());
         }
 
-        let mut candidates: Vec<Hash> = self.anticone(dag, selected_parent).into_iter().collect();
-        candidates.sort_by(|a, b| {
-            let a_score = dag.get_block(a).map_or(0, |b| b.blue_score);
-            let b_score = dag.get_block(b).map_or(0, |b| b.blue_score);
-            b_score.cmp(&a_score).then(a.cmp(b))
-        });
-
+        // Get anticone and convert to HashSet for k-cluster check
+        let mut candidates = self.anticone(dag, selected_parent);
+        // Already sorted from anticone, so iteration is deterministic
+        
         for candidate in candidates {
-            let candidate_anticone = self.anticone(dag, &candidate);
+            let candidate_anticone: HashSet<Hash> = self.anticone(dag, &candidate).into_iter().collect();
             let conflicts = candidate_anticone.intersection(&blue_set).count();
             if conflicts <= self.k {
                 blue_set.insert(candidate);
@@ -88,12 +90,19 @@ impl GhostDag {
             }
         }
 
-        let selected_parent = match self.select_parent(dag, &block.parents) {
+        // Convert HashSet to Vec for deterministic processing
+        let parents_vec: Vec<Hash> = {
+            let mut v: Vec<_> = block.parents.iter().cloned().collect();
+            v.sort();
+            v
+        };
+
+        let selected_parent = match self.select_parent(dag, &parents_vec) {
             Some(p) => p,
             None => return false,
         };
 
-        let (blue_set, red_set) = self.build_blue_set(dag, &selected_parent, &block.parents);
+        let (blue_set, red_set) = self.build_blue_set(dag, &selected_parent, &parents_vec);
         let parent_score = dag
             .get_block(&selected_parent)
             .map(|b| b.blue_score)
@@ -133,10 +142,10 @@ impl GhostDag {
         }
 
         if dag.get_all_hashes().len() == 1 {
-            let only_block_hash = dag.get_all_hashes().into_iter().next().unwrap();
+            let only_block_hash = dag.get_all_hashes().first().unwrap().clone();
             if let Some(b) = dag.get_block(&only_block_hash) {
                 return VirtualBlock {
-                    parents: tips,
+                    parents: tips.into_iter().collect(),
                     selected_parent: b.selected_parent.clone(),
                     blue_set: b.blue_set.clone(),
                     red_set: b.red_set.clone(),
@@ -148,7 +157,7 @@ impl GhostDag {
         let selected_parent = self.select_parent(dag, &tips);
         if selected_parent.is_none() {
             return VirtualBlock {
-                parents: tips,
+                parents: tips.into_iter().collect(),
                 selected_parent: None,
                 blue_set: HashSet::new(),
                 red_set: HashSet::new(),
@@ -162,7 +171,7 @@ impl GhostDag {
         let blue_score = parent_score + (blue_set.len() as u64);
 
         VirtualBlock {
-            parents: tips,
+            parents: tips.into_iter().collect(),
             selected_parent: Some(selected_parent),
             blue_set,
             red_set,

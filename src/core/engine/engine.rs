@@ -78,13 +78,24 @@ impl Engine {
     }
 
     /// Remove confirmed transactions from mempool.
-    pub fn remove_confirmed(&mut self, tx_ids: &[Hash]) {
+    pub fn remove_confirmed(&mut self, tx_ids: &[Hash]) -> Result<(), CoreError> {
         self.mempool.remove_confirmed(tx_ids)
     }
 
     /// Select transactions for block creation from mempool.
-    pub fn select_txs_for_block(&self, max_size: usize) -> Vec<Transaction> {
-        self.mempool.select_txs_for_block(max_size)
+    /// Uses fee-rate priority with DAG-aware topological ordering.
+    pub fn select_txs_for_block(&self) -> Result<Vec<Transaction>, CoreError> {
+        self.mempool.select_txs_for_block()
+    }
+
+    /// Select limited number of transactions for block creation
+    pub fn select_txs_limited(&self, max_count: usize) -> Result<Vec<Transaction>, CoreError> {
+        self.mempool.select_txs_limited(max_count)
+    }
+
+    /// Get mempool statistics
+    pub fn get_mempool_stats(&self) -> Result<mempool::MempoolStats, CoreError> {
+        self.mempool.get_stats()
     }
 
     pub fn get_state(&self) -> &BlockchainState {
@@ -124,7 +135,7 @@ impl Engine {
     }
 
     pub fn get_ancestors(&self, hash: &Hash) -> HashSet<Hash> {
-        self.dag.get_ancestors(hash)
+        self.dag.get_ancestors(hash).into_iter().collect()
     }
 
     pub fn get_descendants(&self, hash: &Hash) -> HashSet<Hash> {
@@ -239,6 +250,21 @@ impl Engine {
         } else {
             u64::MAX / difficulty
         }
+    }
+
+    /// Reinsert reverted transactions from reorg buffer into mempool
+    ///
+    /// Called after successful reorg execution to restore transactions to mempool.
+    /// Revalidates transactions and maintains deterministic ordering.
+    pub fn reinsert_reverted_transactions(&mut self, buffer: &crate::core::consensus::reorg::ReorgTxBuffer) -> Result<(), CoreError> {
+        self.mempool.reinsert_reverted_transactions(buffer)
+    }
+
+    /// Execute a reorg by updating state and returning the reorg tx buffer
+    ///
+    /// This method encapsulates the Engine-level safe borrow path for reorg.
+    pub fn execute_reorg_with_buffer(&mut self, reorg: &crate::core::consensus::reorg::ReorgState) -> Result<crate::core::consensus::reorg::ReorgTxBuffer, CoreError> {
+        crate::core::consensus::reorg::execute_reorg_with_buffer(&self.dag, &mut self.state, reorg)
     }
 
     // === Internal accessors for submodules ===
