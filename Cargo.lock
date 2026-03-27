@@ -446,6 +446,7 @@ dependencies = [
  "ark-ed-on-bls12-381-bandersnatch",
  "ark-ff",
  "ark-poly",
+ "ark-serialize",
  "blake3",
  "hex",
  "k256",

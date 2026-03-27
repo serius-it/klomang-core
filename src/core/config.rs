@@ -20,7 +20,7 @@ impl Default for Config {
             data_dir: "./data".to_string(),
             max_block_weight: 4_000_000,
             mempool_max_size: 10000,
-            block_reward: 50,
+            block_reward: 100,
             k: 18,
             target_block_time: 1,
             finality_depth: 100,

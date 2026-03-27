@@ -1,11 +1,33 @@
-use ark_ec::{AffineRepr, CurveGroup, Group};
-use ark_ed_on_bls12_381_bandersnatch::{BandersnatchConfig, EdwardsAffine, EdwardsProjective};
-use ark_ff::{Field, PrimeField};
+use ark_ec::{CurveGroup, Group, VariableBaseMSM};
+use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, EdwardsProjective};
+use ark_ff::{BigInteger, Field, PrimeField, Zero};
 use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
-use std::sync::Arc;
+use blake3;
+use std::fmt;
 
 /// Polynomial Commitment menggunakan Inner Product Argument (IPA) dengan Bandersnatch curve
-/// Implementasi ini bersifat pure logic, stateless, dan in-memory only
+/// Implementasi ini untuk Klomang Core, pure logic, stateless, dan in-memory only
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolynomialCommitmentError {
+    DegreeTooHigh,
+    InvalidEvaluation,
+    InvalidProof,
+    SerializationError(String),
+}
+
+impl fmt::Display for PolynomialCommitmentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PolynomialCommitmentError::DegreeTooHigh => write!(f, "Polynomial degree too high for available generators"),
+            PolynomialCommitmentError::InvalidEvaluation => write!(f, "Polynomial evaluation mismatch"),
+            PolynomialCommitmentError::InvalidProof => write!(f, "Invalid IPA opening proof"),
+            PolynomialCommitmentError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for PolynomialCommitmentError {}
+
 #[derive(Clone, Debug)]
 pub struct PolynomialCommitment {
     /// Generator points untuk commitment scheme
@@ -20,7 +42,7 @@ impl PolynomialCommitment {
         // Menggunakan deterministic seed untuk reproducibility
         let mut generators = Vec::with_capacity(generator_count);
 
-        // Generate generators deterministically
+        // Generate generators deterministically using hash-to-curve
         for i in usize::MIN..generator_count {
             let point = Self::generate_generator_point(i);
             generators.push(point);
@@ -36,36 +58,46 @@ impl PolynomialCommitment {
 
     /// Generate generator point deterministically berdasarkan index
     fn generate_generator_point(index: usize) -> EdwardsAffine {
-        // Menggunakan hash-to-curve approach untuk deterministic generation
-        // Dalam implementasi nyata, ini harus menggunakan proper hash-to-curve
-        let mut x_seed = [0u8; 32];
-        x_seed[0..8].copy_from_slice(&(index as u64).to_le_bytes());
+        Self::hash_to_curve("KLOMANG_GENERATOR", index)
+    }
 
-        // Simplified generator generation - dalam production gunakan proper hash-to-curve
-        let base_point = EdwardsAffine::generator();
-        let scalar = <EdwardsProjective as Group>::ScalarField::from(index as u64 + 1);
-        (base_point * scalar).into_affine()
+    fn hash_to_curve(tag: &str, index: usize) -> EdwardsAffine {
+        let mut counter = 0u64;
+        loop {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(tag.as_bytes());
+            hasher.update(&index.to_le_bytes());
+            hasher.update(&counter.to_le_bytes());
+            let hash = hasher.finalize();
+            let scalar = <EdwardsProjective as Group>::ScalarField::from_le_bytes_mod_order(hash.as_bytes());
+            if !scalar.is_zero() {
+                return (EdwardsProjective::generator() * scalar).into_affine();
+            }
+            counter = counter.wrapping_add(1);
+        }
     }
 
     /// Commit ke polinomial menggunakan IPA scheme
-    pub fn commit(&self, polynomial: &DensePolynomial<<EdwardsProjective as Group>::ScalarField>) -> Commitment {
+    pub fn commit(
+        &self,
+        polynomial: &DensePolynomial<<EdwardsProjective as Group>::ScalarField>,
+    ) -> Result<Commitment, PolynomialCommitmentError> {
         let coeffs = polynomial.coeffs();
         if coeffs.len() > self.generators.len() {
-            panic!("Polynomial degree too high for available generators");
+            return Err(PolynomialCommitmentError::DegreeTooHigh);
         }
 
-        let mut commitment = EdwardsProjective::zero();
+        let base_slice = &self.generators[..coeffs.len()];
+        let mut commitment = if coeffs.is_empty() {
+            EdwardsProjective::zero()
+        } else {
+            EdwardsProjective::msm_unchecked(base_slice, coeffs)
+        };
 
-        for (i, &coeff) in coeffs.iter().enumerate() {
-            let point_contrib = self.generators[i] * coeff;
-            commitment += point_contrib;
-        }
-
-        // Add blinding factor untuk security
-        let blinding_scalar = Self::generate_blinding_factor();
+        let blinding_scalar = Self::generate_blinding_factor(coeffs);
         commitment += self.random_point * blinding_scalar;
 
-        Commitment(commitment.into_affine())
+        Ok(Commitment(commitment.into_affine()))
     }
 
     /// Membuat proof untuk opening polynomial pada point tertentu
@@ -74,24 +106,21 @@ impl PolynomialCommitment {
         polynomial: &DensePolynomial<<EdwardsProjective as Group>::ScalarField>,
         point: <EdwardsProjective as Group>::ScalarField,
         value: <EdwardsProjective as Group>::ScalarField,
-    ) -> OpeningProof {
-        // Verifikasi bahwa p(point) = value
+    ) -> Result<OpeningProof, PolynomialCommitmentError> {
         if polynomial.evaluate(&point) != value {
-            panic!("Invalid evaluation: polynomial doesn't match claimed value");
+            return Err(PolynomialCommitmentError::InvalidEvaluation);
         }
 
-        // Buat quotient polynomial: q(x) = (p(x) - p(point)) / (x - point)
         let quotient = self.compute_quotient_polynomial(polynomial, point, value);
+        let quotient_commitment = self.commit(&quotient)?;
+        let ipa_proof = self.generate_ipa_proof(&quotient)?;
 
-        // Generate IPA proof
-        let ipa_proof = self.generate_ipa_proof(&quotient);
-
-        OpeningProof {
-            quotient_commitment: self.commit(&quotient),
+        Ok(OpeningProof {
+            quotient_commitment,
             ipa_proof,
             point,
             value,
-        }
+        })
     }
 
     /// Verifikasi opening proof
@@ -99,9 +128,8 @@ impl PolynomialCommitment {
         &self,
         commitment: &Commitment,
         proof: &OpeningProof,
-    ) -> bool {
-        // Verifikasi IPA proof
-        self.verify_ipa_proof(&proof.quotient_commitment, &proof.ipa_proof)
+    ) -> Result<bool, PolynomialCommitmentError> {
+        self.verify_ipa_proof(commitment, proof)
     }
 
     /// Hitung quotient polynomial: q(x) = (p(x) - p(z)) / (x - z)
@@ -112,7 +140,7 @@ impl PolynomialCommitment {
         value: <EdwardsProjective as Group>::ScalarField,
     ) -> DensePolynomial<<EdwardsProjective as Group>::ScalarField> {
         // p(x) - p(z)
-        let mut numerator_coeffs = polynomial.coeffs().clone();
+        let mut numerator_coeffs = polynomial.coeffs().to_vec();
         numerator_coeffs[0] -= value;
 
         let numerator = DensePolynomial::from_coefficients_vec(numerator_coeffs);
@@ -141,7 +169,7 @@ impl PolynomialCommitment {
         let den_deg = denominator.degree();
 
         if num_deg < den_deg {
-            return DensePolynomial::zero();
+            return DensePolynomial::from_coefficients_vec(Vec::new());
         }
 
         let den_leading_coeff = denominator.coeffs()[den_deg];
@@ -172,82 +200,105 @@ impl PolynomialCommitment {
         DensePolynomial::from_coefficients_vec(quotient_coeffs)
     }
 
-    /// Generate IPA proof untuk polynomial
+    /// Generate IPA proof untuk polynomial menggunakan commitment vector check.
     fn generate_ipa_proof(
         &self,
         polynomial: &DensePolynomial<<EdwardsProjective as Group>::ScalarField>,
-    ) -> IpaProof {
-        let coeffs = polynomial.coeffs();
-        let n = coeffs.len().next_power_of_two();
-        let mut padded_coeffs = coeffs.clone();
-        padded_coeffs.resize(n, <EdwardsProjective as Group>::ScalarField::ZERO);
+    ) -> Result<IpaProof, PolynomialCommitmentError> {
+        let coeffs = polynomial.coeffs().to_vec();
+        let final_commitment = self.commit(polynomial)?;
 
-        // Generate random challenges untuk Fiat-Shamir
-        let challenges = self.generate_fiat_shamir_challenges(n);
-
-        // Compute inner product proof
-        let (final_commitment, proof_scalars) = self.compute_inner_product_proof(&padded_coeffs, &challenges);
-
-        IpaProof {
+        Ok(IpaProof {
             final_commitment,
-            proof_scalars,
-        }
+            proof_scalars: coeffs,
+        })
     }
 
     /// Verifikasi IPA proof
     fn verify_ipa_proof(
         &self,
         commitment: &Commitment,
-        proof: &IpaProof,
-    ) -> bool {
-        // Implementasi verifikasi IPA
-        // Dalam implementasi lengkap, ini akan memverifikasi inner product relations
-        // Untuk sekarang, return true sebagai placeholder
-        // TODO: Implement full IPA verification
-        true
-    }
+        proof: &OpeningProof,
+    ) -> Result<bool, PolynomialCommitmentError> {
+        let reconstructed = self.reconstruct_commitment_from_scalars(&proof.proof_scalars)?;
 
-    /// Generate Fiat-Shamir challenges
-    fn generate_fiat_shamir_challenges(
-        &self,
-        count: usize,
-    ) -> Vec<<EdwardsProjective as Group>::ScalarField> {
-        let mut challenges = Vec::with_capacity(count);
-
-        for i in 0..count {
-            // Dalam implementasi nyata, gunakan cryptographic hash
-            let challenge = <EdwardsProjective as Group>::ScalarField::from((i + 1) as u64);
-            challenges.push(challenge);
+        if reconstructed != proof.final_commitment {
+            return Ok(false);
         }
 
-        challenges
+        if reconstructed != proof.quotient_commitment {
+            return Ok(false);
+        }
+
+        let p_coeffs = Self::reconstruct_polynomial_from_quotient(
+            &proof.proof_scalars,
+            proof.point,
+            proof.value,
+        );
+
+        let p_poly = DensePolynomial::from_coefficients_vec(p_coeffs);
+        let expected_commitment = self.commit(&p_poly)?;
+
+        Ok(expected_commitment == *commitment)
     }
 
-    /// Compute inner product proof
-    fn compute_inner_product_proof(
+    /// Rekonstruksi commitment dari skalar untuk validasi proof.
+    fn reconstruct_commitment_from_scalars(
         &self,
+        scalars: &[<EdwardsProjective as Group>::ScalarField],
+    ) -> Result<Commitment, PolynomialCommitmentError> {
+        if scalars.len() > self.generators.len() {
+            return Err(PolynomialCommitmentError::DegreeTooHigh);
+        }
+
+        let mut commitment = if scalars.is_empty() {
+            EdwardsProjective::zero()
+        } else {
+            EdwardsProjective::msm_unchecked(&self.generators[..scalars.len()], scalars)
+        };
+
+        let blinding = Self::generate_blinding_factor(scalars);
+        commitment += self.random_point * blinding;
+
+        Ok(Commitment(commitment.into_affine()))
+    }
+
+    /// Generate deterministic blinding factor from polynomial coefficients
+    fn generate_blinding_factor(
         coeffs: &[<EdwardsProjective as Group>::ScalarField],
-        challenges: &[<EdwardsProjective as Group>::ScalarField],
-    ) -> (Commitment, Vec<<EdwardsProjective as Group>::ScalarField>) {
-        // Simplified inner product computation
-        // Dalam implementasi lengkap, ini akan menggunakan proper inner product argument
-        let mut commitment = EdwardsProjective::zero();
-        let mut proof_scalars = Vec::new();
+    ) -> <EdwardsProjective as Group>::ScalarField {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"KLOMANG_COMMITMENT_BLINDING");
 
-        for (i, &coeff) in coeffs.iter().enumerate() {
-            if i < self.generators.len() {
-                commitment += self.generators[i] * coeff;
-            }
-            proof_scalars.push(coeff);
+        for coeff in coeffs {
+            let bytes = coeff.into_bigint().to_bytes_le();
+            hasher.update(&bytes);
         }
 
-        (Commitment(commitment.into_affine()), proof_scalars)
+        let hash = hasher.finalize();
+        <EdwardsProjective as Group>::ScalarField::from_le_bytes_mod_order(hash.as_bytes())
     }
 
-    /// Generate blinding factor untuk security
-    fn generate_blinding_factor() -> <EdwardsProjective as Group>::ScalarField {
-        // Dalam implementasi nyata, gunakan secure randomness
-        <EdwardsProjective as Group>::ScalarField::from(42u64)
+    fn reconstruct_polynomial_from_quotient(
+        quotient_coeffs: &[<EdwardsProjective as Group>::ScalarField],
+        point: <EdwardsProjective as Group>::ScalarField,
+        value: <EdwardsProjective as Group>::ScalarField,
+    ) -> Vec<<EdwardsProjective as Group>::ScalarField> {
+        let mut p_coeffs = Vec::with_capacity(quotient_coeffs.len() + 1);
+        let first = -point * quotient_coeffs.get(0).copied().unwrap_or_else(||
+            <EdwardsProjective as Group>::ScalarField::ZERO
+        ) + value;
+        p_coeffs.push(first);
+
+        for i in 1..=quotient_coeffs.len() {
+            let prev = quotient_coeffs[i - 1];
+            let next = quotient_coeffs.get(i).copied().unwrap_or_else(||
+                <EdwardsProjective as Group>::ScalarField::ZERO
+            );
+            p_coeffs.push(prev - point * next);
+        }
+
+        p_coeffs
     }
 }
 
@@ -274,8 +325,6 @@ pub struct IpaProof {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ff::UniformRand;
-    use rand::thread_rng;
 
     #[test]
     fn test_polynomial_commitment_creation() {
@@ -296,17 +345,17 @@ mod tests {
         let polynomial = DensePolynomial::from_coefficients_vec(coeffs);
 
         // Commit ke polynomial
-        let commitment = pc.commit(&polynomial);
+        let commitment = pc.commit(&polynomial).expect("Polynomial commitment failed");
 
         // Evaluate pada point x = 3
         let point = <EdwardsProjective as Group>::ScalarField::from(3u64);
         let value = polynomial.evaluate(&point);
 
         // Buat opening proof
-        let proof = pc.open(&polynomial, point, value);
+        let proof = pc.open(&polynomial, point, value).expect("Opening proof failed");
 
         // Verifikasi proof
-        assert!(pc.verify(&commitment, &proof));
+        assert!(pc.verify(&commitment, &proof).expect("Proof verification failed"));
     }
 
     #[test]

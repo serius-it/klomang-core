@@ -1,5 +1,9 @@
 pub mod transaction;
 pub mod utxo;
+pub mod storage;
+pub mod v_trie;
+
+pub use self::storage::{MemoryStorage, Storage};
 
 use crate::core::crypto::Hash;
 use crate::core::state::utxo::{UtxoSet, UtxoChangeSet, OutPoint};
@@ -8,8 +12,8 @@ use crate::core::dag::BlockNode;
 use crate::core::errors::CoreError;
 use std::collections::HashMap;
 
-/// Blockchain state management
-/// 
+/// Klomang Core blockchain state management
+///
 /// Tracks consensus state and finality information for the DAG.
 #[derive(Debug, Clone)]
 pub struct BlockchainState {

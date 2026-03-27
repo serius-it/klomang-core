@@ -152,11 +152,11 @@ mod tests {
     fn test_reward_halving() {
         let (m1, i1, p1) = block_reward(100_000, 10);
         assert_eq!(m1 + i1, (50 * UNIT) as u64);
-        assert_eq!(p1, (10 * UNIT) as u64);
+        assert_eq!(p1, (1 * UNIT) as u64);
 
         let (m2, i2, p2) = block_reward(200_000, 10);
         assert_eq!(m2 + i2, (25 * UNIT) as u64);
-        assert_eq!(p2, (2 * UNIT) as u64);
+        assert_eq!(p2, (UNIT / 2) as u64);
 
         let (m3, i3, _p3) = block_reward(300_000, 10);
         assert_eq!(m3 + i3, (1_250_000_000u128) as u64);

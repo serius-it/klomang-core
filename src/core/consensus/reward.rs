@@ -1,99 +1,89 @@
-/// Fee + Subsidy Reward System (Bitcoin-style, DAG-aware)
+/// Fee + subsidy reward system for Klomang Core.
 ///
-/// Implements block reward calculation combining:
-/// - Subsidy: Base emission from `emission.rs` (capped by hard supply limit)
-/// - Fees: Transaction fees from accepted transactions (prevents double-claim)
-///
-/// DAG Rules:
-/// - Only BLUE blocks receive reward
-/// - RED blocks have 0 reward
-/// - Fees calculated only from accepted transactions (virtual chain)
+/// This module implements deterministic, in-memory reward calculations
+/// based on UTXO transaction inputs and a halving schedule every 100,000 blocks.
 
+use crate::core::config::Config;
+use crate::core::consensus::emission;
 use crate::core::dag::BlockNode;
-use crate::core::crypto::Hash;
 use crate::core::errors::CoreError;
-use super::emission;
-use std::collections::HashSet;
+use crate::core::state::transaction::Transaction;
+use crate::core::state::utxo::UtxoSet;
 
-/// Calculate total fees from all transactions in a block
-/// 
-/// Fee = sum(input_values) - sum(output_values)
-/// For coinbase transactions (no inputs), fee is 0.
+/// Calculate fee for a transaction using the current UTXO set.
 ///
-/// Note: This requires access to UTXO state to get input values.
-/// In the reward system context, we sum fees from accepted transactions only.
-pub fn calculate_fees(_block: &BlockNode, _accepted_txs: &HashSet<Hash>) -> Result<u64, CoreError> {
-    // Initial implementation: fees will be calculated from accepted transactions
-    // For now, return 0 as placeholder - will be filled with actual fee calculation
-    // when UTXO state is available during validation
-    Ok(0)
+/// Fee = sum(inputs) - sum(outputs)
+/// Returns an error if the transaction is invalid or spends more than its inputs.
+pub fn calculate_fees(tx: &Transaction, utxo: &UtxoSet) -> Result<u64, CoreError> {
+    utxo.validate_tx(tx)
 }
 
-/// Calculate fees from only accepted transactions (DAG-aware)
+/// Calculate total fees for all non-coinbase transactions in a block.
 ///
-/// This prevents double-counting fees:
-/// - Only transactions in the virtual chain (accepted by consensus) contribute fees
-/// - Orphaned or rejected transactions don't count
-///
-/// Parameters:
-/// - block: The block containing transactions
-/// - accepted_txs: Set of transaction hashes accepted in the virtual chain
-///
-/// Returns: Total fees from accepted transactions, or error
-pub fn calculate_accepted_fees(
-    block: &BlockNode,
-    accepted_txs: &HashSet<Hash>,
-) -> Result<u64, CoreError> {
+/// This uses a cloned UTXO state and applies each transaction sequentially so
+/// fees are computed deterministically for blocks with dependent transactions.
+pub fn calculate_accepted_fees(block: &BlockNode, utxo: &UtxoSet) -> Result<u64, CoreError> {
     let mut total_fees: u64 = 0;
+    let mut working_utxo = utxo.clone();
 
     for tx in &block.transactions {
-        // Skip coinbase transactions (no inputs, no fees)
         if tx.is_coinbase() {
             continue;
         }
 
-        // Only count fees from accepted transactions
-        if accepted_txs.contains(&tx.id) {
-            // Fee calculation requires UTXO state (sum of inputs - sum of outputs)
-            // This is a placeholder - actual implementation needs state context
-            //
-            // In practice:
-            // fee = sum(prev_outputs[input.prev_tx][input.index].value for each input)
-            //       - sum(output.value for each output)
+        let fee = calculate_fees(tx, &working_utxo)?;
+        working_utxo.apply_tx(tx)?;
 
-            // For now, we conservatively assume 0 fees from each transaction
-            // The actual fee calculation happens in the transaction validation layer
-            // where UTXO state is available
-            let _tx_fee: u64 = 0;
-
-            // Safely add to total, preventing overflow
-            match total_fees.checked_add(_tx_fee) {
-                Some(new_total) => total_fees = new_total,
-                None => {
-                    return Err(CoreError::TransactionError(
-                        "Fee overflow in reward calculation".to_string(),
-                    ))
-                }
-            }
-        }
+        total_fees = total_fees.checked_add(fee).ok_or_else(|| {
+            CoreError::TransactionError("Fee overflow in accepted fee calculation".to_string())
+        })?;
     }
 
     Ok(total_fees)
 }
 
-/// Calculate total block reward combining subsidy + accepted fees
+/// Calculate the halving block reward in whole coins.
 ///
-/// Rules:
-/// - BLUE blocks: reward = subsidy + accepted_fees
-/// - RED blocks: reward = 0 (no reward for red blocks)
+/// Uses the default config block reward as the initial reward and halves it every
+/// 100,000 blocks using integer division.
+pub fn calculate_block_reward(height: u64) -> u64 {
+    let initial_reward = Config::default().block_reward;
+    let halvings = height / emission::HALVING_INTERVAL;
+
+    if halvings >= 64 {
+        return 0;
+    }
+
+    initial_reward >> halvings
+}
+
+/// Calculate total block reward (subsidy + transaction fees) in smallest units.
 ///
-/// Parameters:
-/// - block: The block node
-/// - daa_score: Blue/DAA score for subsidy calculation
-/// - is_blue: Whether this block is in the blue set
-/// - accepted_txs: Set of accepted transactions for fee calculation
-///
-/// Returns: Total reward amount in satoshis, or error
+/// Requires the block height for halving and the active UTXO state for fee calculation.
+pub fn block_total_reward(
+    block: &BlockNode,
+    height: u64,
+    is_blue: bool,
+    utxo: &UtxoSet,
+) -> Result<u64, CoreError> {
+    if !is_blue {
+        return Ok(0);
+    }
+
+    let subsidy_coins = calculate_block_reward(height) as u128;
+    let subsidy_units = subsidy_coins.saturating_mul(emission::UNIT);
+    let fees = calculate_accepted_fees(block, utxo)?;
+    let total = subsidy_units
+        .checked_add(fees as u128)
+        .ok_or_else(|| {
+            CoreError::TransactionError("Reward overflow: subsidy + fees exceed max limit".to_string())
+        })?;
+
+    total
+        .try_into()
+        .map_err(|_| CoreError::TransactionError("Total reward overflow u64".to_string()))
+}
+
 pub fn create_coinbase_tx(
     miner_reward_address: &crate::core::crypto::Hash,
     node_reward_pool_address: Option<&crate::core::crypto::Hash>,
@@ -140,51 +130,10 @@ pub fn create_coinbase_tx(
     tx
 }
 
-pub fn block_total_reward(
-    block: &BlockNode,
-    daa_score: u64,
-    is_blue: bool,
-    accepted_txs: &HashSet<Hash>,
-) -> Result<u64, CoreError> {
-    // RED blocks get 0 reward
-    if !is_blue {
-        return Ok(0);
-    }
-
-    // Get subsidy from emission system (includes cap check)
-    let subsidy = emission::capped_reward(daa_score);
-
-    // Calculate fees from accepted transactions only (prevents double-counting)
-    let fees = calculate_accepted_fees(block, accepted_txs)?;
-
-    // Total reward = subsidy + fees
-    // Use checked_add to detect overflow
-    let total = subsidy
-        .checked_add(fees as u128)
-        .ok_or_else(|| {
-            CoreError::TransactionError("Reward overflow: subsidy + fees exceed max supply".to_string())
-        })?;
-
-    total
-        .try_into()
-        .map_err(|_| CoreError::TransactionError("Total reward overflow u64".to_string()))
-}
-
-/// Validate coinbase transaction value against computed reward
-///
-/// Called after GHOSTDAG consensus (when we know if block is BLUE/RED)
-/// to ensure coinbase exactly matches the allowed reward.
-///
-/// Parameters:
-/// - block: Block containing the coinbase
-/// - actual_reward: The exact amount the coinbase should contain
-///
-/// Returns: Ok if valid, error if coinbase doesn't match expected reward
 pub fn validate_coinbase_reward(
     block: &BlockNode,
     actual_reward: u128,
 ) -> Result<(), CoreError> {
-    // Find coinbase transaction (transaction with no inputs)
     let coinbase_tx = block
         .transactions
         .iter()
@@ -201,7 +150,6 @@ pub fn validate_coinbase_reward(
                 )));
             }
 
-            // At least miner split + node split must exist
             if tx.outputs.len() < 2 {
                 return Err(CoreError::TransactionError(
                     "Coinbase must have at least 2 outputs for miner+node split".to_string(),
@@ -223,7 +171,155 @@ pub fn validate_coinbase_reward(
 mod tests {
     use super::*;
     use crate::core::crypto::Hash;
-    use crate::core::state::transaction::{Transaction, TxOutput};
+    use crate::core::crypto::schnorr::KeyPairWrapper;
+    use crate::core::state::transaction::{SigHashType, Transaction, TxInput, TxOutput};
+    use crate::core::state::utxo::UtxoSet;
+
+    fn sign_transaction(tx: &mut Transaction, keypair: &KeyPairWrapper) {
+        let msg = crate::core::crypto::schnorr::tx_message(tx);
+        let signature = keypair.sign(&msg);
+        let pubkey_bytes = keypair.public_key().to_bytes();
+        let sig_bytes = signature.to_bytes();
+
+        for input in tx.inputs.iter_mut() {
+            input.signature = sig_bytes.to_vec();
+            input.pubkey = pubkey_bytes.to_vec();
+        }
+    }
+
+    #[test]
+    fn test_calculate_fees_valid_transaction() {
+        let mut utxo = UtxoSet::new();
+        let prev_tx = Hash::new(b"prev_tx");
+        let sender_hash = Hash::new(b"sender");
+
+        utxo.utxos.insert(
+            (prev_tx.clone(), 0),
+            TxOutput {
+                value: 200,
+                pubkey_hash: sender_hash.clone(),
+            },
+        );
+
+        let keypair = KeyPairWrapper::new();
+        let mut tx = Transaction {
+            id: Hash::new(b"tx1"),
+            inputs: vec![TxInput {
+                prev_tx: prev_tx.clone(),
+                index: 0,
+                signature: vec![],
+                pubkey: vec![],
+                sighash_type: SigHashType::All,
+            }],
+            outputs: vec![TxOutput {
+                value: 150,
+                pubkey_hash: Hash::new(b"recipient"),
+            }],
+            chain_id: 1,
+            locktime: 0,
+        };
+
+        sign_transaction(&mut tx, &keypair);
+        tx.id = tx.calculate_id();
+
+        assert_eq!(calculate_fees(&tx, &utxo).unwrap(), 50);
+    }
+
+    #[test]
+    fn test_calculate_fees_invalid_transaction() {
+        let mut utxo = UtxoSet::new();
+        let prev_tx = Hash::new(b"prev_tx");
+
+        utxo.utxos.insert(
+            (prev_tx.clone(), 0),
+            TxOutput {
+                value: 100,
+                pubkey_hash: Hash::new(b"sender"),
+            },
+        );
+
+        let keypair = KeyPairWrapper::new();
+        let mut tx = Transaction {
+            id: Hash::new(b"tx2"),
+            inputs: vec![TxInput {
+                prev_tx: prev_tx.clone(),
+                index: 0,
+                signature: vec![],
+                pubkey: vec![],
+                sighash_type: SigHashType::All,
+            }],
+            outputs: vec![TxOutput {
+                value: 150,
+                pubkey_hash: Hash::new(b"recipient"),
+            }],
+            chain_id: 1,
+            locktime: 0,
+        };
+
+        sign_transaction(&mut tx, &keypair);
+        tx.id = tx.calculate_id();
+
+        assert!(calculate_fees(&tx, &utxo).is_err());
+    }
+
+    #[test]
+    fn test_calculate_accepted_fees_sequential_block() {
+        let mut utxo = UtxoSet::new();
+        let prev_tx = Hash::new(b"prev_tx");
+
+        utxo.utxos.insert(
+            (prev_tx.clone(), 0),
+            TxOutput {
+                value: 200,
+                pubkey_hash: Hash::new(b"sender"),
+            },
+        );
+
+        let keypair = KeyPairWrapper::new();
+        let mut tx = Transaction {
+            id: Hash::new(b"tx3"),
+            inputs: vec![TxInput {
+                prev_tx: prev_tx.clone(),
+                index: 0,
+                signature: vec![],
+                pubkey: vec![],
+                sighash_type: SigHashType::All,
+            }],
+            outputs: vec![TxOutput {
+                value: 120,
+                pubkey_hash: Hash::new(b"recipient"),
+            }],
+            chain_id: 1,
+            locktime: 0,
+        };
+
+        sign_transaction(&mut tx, &keypair);
+        tx.id = tx.calculate_id();
+
+        let block = BlockNode {
+            id: Hash::new(b"test"),
+            parents: Default::default(),
+            children: Default::default(),
+            selected_parent: None,
+            blue_set: Default::default(),
+            red_set: Default::default(),
+            blue_score: 100,
+            timestamp: 1000,
+            difficulty: 1000,
+            nonce: 0,
+            transactions: vec![tx],
+        };
+
+        let total_fees = calculate_accepted_fees(&block, &utxo).unwrap();
+        assert_eq!(total_fees, 80);
+    }
+
+    #[test]
+    fn test_calculate_block_reward_halving() {
+        assert_eq!(calculate_block_reward(0), 100);
+        assert_eq!(calculate_block_reward(100_000), 50);
+        assert_eq!(calculate_block_reward(200_000), 25);
+    }
 
     #[test]
     fn test_red_block_reward_is_zero() {
@@ -241,8 +337,8 @@ mod tests {
             transactions: vec![],
         };
 
-        let accepted_txs = HashSet::new();
-        let reward = block_total_reward(&block, 100, false, &accepted_txs);
+        let utxo = UtxoSet::new();
+        let reward = block_total_reward(&block, 0, false, &utxo);
 
         assert_eq!(reward.ok(), Some(0));
     }
@@ -263,14 +359,10 @@ mod tests {
             transactions: vec![],
         };
 
-        let accepted_txs = HashSet::new();
-        let reward = block_total_reward(&block, 0, true, &accepted_txs);
+        let utxo = UtxoSet::new();
+        let reward = block_total_reward(&block, 0, true, &utxo);
 
-        // Genesis block (daa_score=0) has subsidy of 100 coins in smallest unit 8 decimal
-        assert_eq!(
-            reward.ok(),
-            Some((100u128 * crate::core::consensus::emission::UNIT).try_into().unwrap()),
-        );
+        assert_eq!(reward.ok(), Some((100u128 * emission::UNIT).try_into().unwrap()));
     }
 
     #[test]
@@ -315,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_create_coinbase_tx_with_active_node_count() {
-        let total_reward = crate::core::consensus::emission::BASE_REWARD;
+        let total_reward = emission::BASE_REWARD;
         let miner_address = Hash::new(b"miner");
         let node_pool_address = Hash::new(b"pool");
         let active_node_count = 90;
@@ -365,28 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_accepted_fees() {
-        let block = BlockNode {
-            id: Hash::new(b"test"),
-            parents: Default::default(),
-            children: Default::default(),
-            selected_parent: None,
-            blue_set: Default::default(),
-            red_set: Default::default(),
-            blue_score: 100,
-            timestamp: 1000,
-            difficulty: 1000,
-            nonce: 0,
-            transactions: vec![],
-        };
-
-        let accepted_txs = HashSet::new();
-        let fees = calculate_accepted_fees(&block, &accepted_txs);
-
-        assert_eq!(fees.ok(), Some(0));
-    }
-
-    #[test]
     fn test_no_overflow_in_reward_calculation() {
         let block = BlockNode {
             id: Hash::new(b"test"),
@@ -402,10 +472,11 @@ mod tests {
             transactions: vec![],
         };
 
-        let accepted_txs = HashSet::new();
-        let reward = block_total_reward(&block, 50, true, &accepted_txs);
+        let utxo = UtxoSet::new();
+        let reward = block_total_reward(&block, 50, true, &utxo);
 
-        // Should be ok and not overflow
         assert!(reward.is_ok());
     }
 }
+
+

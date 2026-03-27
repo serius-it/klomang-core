@@ -83,6 +83,22 @@ impl Transaction {
     pub fn is_coinbase(&self) -> bool {
         self.inputs.is_empty()
     }
+
+    pub fn hash_with_index(&self, index: u32) -> [u8; 32] {
+        let mut data = Vec::with_capacity(32 + 4);
+        data.extend_from_slice(self.id.as_bytes());
+        data.extend_from_slice(&index.to_be_bytes());
+        *Hash::new(&data).as_bytes()
+    }
+}
+
+impl TxOutput {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + 32);
+        bytes.extend_from_slice(&self.value.to_be_bytes());
+        bytes.extend_from_slice(self.pubkey_hash.as_bytes());
+        bytes
+    }
 }
 
 impl Default for Transaction {

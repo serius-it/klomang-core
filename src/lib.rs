@@ -12,6 +12,7 @@ pub use core::consensus::ghostdag::GhostDag;
 pub use core::state::transaction::Transaction;
 pub use core::state::BlockchainState;
 pub use core::state::utxo::UtxoSet;
+pub use core::state::{MemoryStorage, Storage};
 pub use core::errors::CoreError;
 pub use core::config::Config;
 pub use core::consensus::emission::{COIN_UNIT, MAX_SUPPLY, block_reward};
